@@ -2,7 +2,7 @@ import streamlit as st
 import yfinance as yf
 import requests
 import pandas as pd
-import pandas_ta as ta
+import numpy as np
 import plotly.graph_objects as go
 import time
 
@@ -15,6 +15,20 @@ auto_refresh = st.sidebar.checkbox("Har 30 sec mein Live Update karein", value=T
 
 ticker_map = {"Nifty 50": "^NSEI", "Sensex": "^BSESN", "Bank Nifty": "^NSEBANK"}
 ticker = ticker_map[index_choice]
+
+def calc_rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1/period, adjust=False).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def calc_atr(df, period=14):
+    high_low = df["High"] - df["Low"]
+    high_close = (df["High"] - df["Close"].shift()).abs()
+    low_close = (df["Low"] - df["Close"].shift()).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    return tr.ewm(alpha=1/period, adjust=False).mean()
 
 def get_nse_pcr():
     try:
@@ -29,33 +43,24 @@ def get_nse_pcr():
         return None
 
 def detect_candlestick_pattern(c1, c2):
-    """Last 2 candles (c2=previous, c1=latest) se Candlestick Pattern pehchanta hai"""
     body1 = abs(c1["Close"] - c1["Open"])
-    body2 = abs(c2["Close"] - c2["Open"])
     upper_wick1 = c1["High"] - max(c1["Open"], c1["Close"])
     lower_wick1 = min(c1["Open"], c1["Close"]) - c1["Low"]
     
-    # Bullish Engulfing
     if c2["Close"] < c2["Open"] and c1["Close"] > c1["Open"] and c1["Close"] > c2["Open"] and c1["Open"] <= c2["Close"]:
         return "Bullish Engulfing (Strong Reversal Up)", 35
-    # Bearish Engulfing
     if c2["Close"] > c2["Open"] and c1["Close"] < c1["Open"] and c1["Close"] < c2["Open"] and c1["Open"] >= c2["Close"]:
         return "Bearish Engulfing (Strong Reversal Down)", -35
-    # Hammer (Bullish)
     if lower_wick1 > (2 * body1) and upper_wick1 < body1 and body1 > 0:
         return "Bullish Hammer (Buyers Active at Bottom)", 25
-    # Shooting Star (Bearish)
     if upper_wick1 > (2 * body1) and lower_wick1 < body1 and body1 > 0:
         return "Shooting Star (Sellers Rejection at Top)", -25
-    # Inside Bar Breakout / Breakdown
     if c1["Close"] > c2["High"]:
         return "15m High Breakout Candle", 25
     if c1["Close"] < c2["Low"]:
         return "15m Low Breakdown Candle", -25
-        
     return "Normal Price Action", 0
 
-# Data Fetch: 15-min (for 45m prediction) & 5-min (for live execution chart)
 df_15 = yf.download(ticker, period="5d", interval="15m", progress=False)
 df_5 = yf.download(ticker, period="2d", interval="5m", progress=False)
 
@@ -67,15 +72,15 @@ if not df_15.empty and not df_5.empty:
     df_15 = df_15.reset_index()
     df_5 = df_5.reset_index()
     
-    # 15-Min Indicators (Brain)
-    df_15["EMA9"] = ta.ema(df_15["Close"], length=9)
-    df_15["EMA21"] = ta.ema(df_15["Close"], length=21)
-    df_15["RSI"] = ta.rsi(df_15["Close"], length=14)
-    df_15["ATR"] = ta.atr(df_15["High"], df_15["Low"], df_15["Close"], length=14)
+    # 15-Min Indicators
+    df_15["EMA9"] = df_15["Close"].ewm(span=9, adjust=False).mean()
+    df_15["EMA21"] = df_15["Close"].ewm(span=21, adjust=False).mean()
+    df_15["RSI"] = calc_rsi(df_15["Close"], 14)
+    df_15["ATR"] = calc_atr(df_15, 14)
     
-    # 5-Min Indicators (Chart)
-    df_5["EMA9"] = ta.ema(df_5["Close"], length=9)
-    df_5["EMA21"] = ta.ema(df_5["Close"], length=21)
+    # 5-Min Indicators
+    df_5["EMA9"] = df_5["Close"].ewm(span=9, adjust=False).mean()
+    df_5["EMA21"] = df_5["Close"].ewm(span=21, adjust=False).mean()
     
     last15 = df_15.iloc[-1]
     prev15 = df_15.iloc[-2]
@@ -84,23 +89,19 @@ if not df_15.empty and not df_5.empty:
     atr_val = float(last15["ATR"])
     pcr = get_nse_pcr() if index_choice == "Nifty 50" else None
 
-    # Study 15-Min Candles for Next 45-Min Behaviour
     score = 0
     reasons = []
     
-    # 1. Candlestick Pattern Study
     pattern_name, pat_score = detect_candlestick_pattern(last15, prev15)
     score += pat_score
     if pat_score != 0:
         reasons.append(f"Pattern: {pattern_name}")
         
-    # 2. EMA Trend Structure
     if last15["Close"] > last15["EMA9"] > last15["EMA21"]:
         score += 30; reasons.append("15m Uptrend (Above 9 & 21 EMA)")
     elif last15["Close"] < last15["EMA9"] < last15["EMA21"]:
         score -= 30; reasons.append("15m Downtrend (Below 9 & 21 EMA)")
         
-    # 3. RSI Momentum + Overbought/Oversold Trap Filter
     trap_warning = ""
     if rsi_val >= 75:
         trap_warning = "⚠️ OVERBOUGHT ZONE (RSI 75+): Chhota pullback aa sakta hai, fresh Call lene se pehle 5m dip ka wait karein!"
@@ -113,14 +114,12 @@ if not df_15.empty and not df_5.empty:
     elif rsi_val < 45:
         score -= 20; reasons.append(f"RSI Bearish Momentum ({rsi_val})")
         
-    # 4. Option Chain PCR
     if pcr:
         if pcr > 1.05:
             score += 20; reasons.append(f"Put Writers Active (PCR {pcr})")
         elif pcr < 0.90:
             score -= 20; reasons.append(f"Call Writers Active (PCR {pcr})")
 
-    # Top Metrics Bar
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric(f"{index_choice} Live", f"{spot}")
     m2.metric("15m Pattern", pattern_name.split("(")[0].strip())
@@ -128,7 +127,6 @@ if not df_15.empty and not df_5.empty:
     m4.metric("Nifty PCR", f"{pcr if pcr else 'N/A'}")
     m5.metric("Volatility (ATR)", f"{round(atr_val, 1)} pts")
 
-    # Next 45-Minute Prediction & Trade Levels Box
     if trap_warning:
         st.info(trap_warning)
         
@@ -149,7 +147,6 @@ if not df_15.empty and not df_5.empty:
         
     st.caption(f"📊 **Study Logic:** {'  •  '.join(reasons) if reasons else 'Market abhi consolidation phase mein hai.'}")
 
-    # Clean 5-Minute Candlestick Chart (No Overnight Gaps)
     plot_5 = df_5.tail(65).copy()
     time_col = "Datetime" if "Datetime" in plot_5.columns else "Date"
     plot_5["TimeStr"] = pd.to_datetime(plot_5[time_col]).dt.strftime("%d %b %H:%M")
@@ -165,7 +162,6 @@ if not df_15.empty and not df_5.empty:
     fig.add_trace(go.Scatter(x=plot_5["TimeStr"], y=plot_5["EMA9"], line=dict(color="#00f2ff", width=1.5), name="9 EMA"))
     fig.add_trace(go.Scatter(x=plot_5["TimeStr"], y=plot_5["EMA21"], line=dict(color="#ff9900", width=1.5), name="21 EMA"))
     
-    # Day High & Low Lines
     day_high = plot_5["High"].max()
     day_low = plot_5["Low"].min()
     fig.add_hline(y=day_high, line_dash="dot", line_color="green", annotation_text=f"Resistance: {round(day_high,1)}")
