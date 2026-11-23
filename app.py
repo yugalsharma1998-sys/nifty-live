@@ -3,10 +3,12 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+from datetime import datetime, timedelta
+import pytz
 import time
 
 st.set_page_config(page_title="PRO Option Buyer Terminal", layout="wide")
-st.title("🎯 Pro Option Buyer Terminal (Sirf CALL BUY / PUT BUY)")
+st.title("🎯 Pro Option Buyer Terminal (Exact Entry, Time Duration & Exit)")
 
 index_choice = st.sidebar.selectbox("Index Chunein", ["Nifty 50", "Bank Nifty", "Sensex"])
 risk_mode = st.sidebar.radio("Trading Style", ["Safe (High Accuracy)", "Scalp (Fast 15m)"])
@@ -19,6 +21,9 @@ orb_limit_map = {"Nifty 50": 130, "Bank Nifty": 300, "Sensex": 400}
 ticker = ticker_map[index_choice]
 strike_step = step_map[index_choice]
 max_orb_width = orb_limit_map[index_choice]
+
+ist = pytz.timezone("Asia/Kolkata")
+now_ist = datetime.now(ist)
 
 def calc_rsi(series, period=14):
     delta = series.diff()
@@ -45,6 +50,14 @@ def calc_adx(df, period=14):
     dx = (abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
     return dx.ewm(alpha=1/period, adjust=False).mean()
 
+def get_move_duration(abs_score, adx_val, rsi_val):
+    if abs_score >= 85 and adx_val >= 30 and (32 < rsi_val < 68):
+        return "Agle 30 se 45 Minute tak (Strong Trend Move)", 35
+    elif abs_score >= 70 and adx_val >= 24:
+        return "Agle 20 se 25 Minute tak (Solid Momentum Move)", 20
+    else:
+        return "Agle 10 se 15 Minute tak (Quick Scalp Move)", 15
+
 df_15 = yf.download(ticker, period="5d", interval="15m", progress=False)
 df_5 = yf.download(ticker, period="5d", interval="5m", progress=False)
 
@@ -56,14 +69,12 @@ if not df_15.empty and not df_5.empty:
     df_15 = df_15.reset_index()
     df_5 = df_5.reset_index()
 
-    # 15m Indicators
     df_15["EMA9"] = df_15["Close"].ewm(span=9, adjust=False).mean()
     df_15["EMA21"] = df_15["Close"].ewm(span=21, adjust=False).mean()
     df_15["RSI"] = calc_rsi(df_15["Close"], 14)
     df_15["ATR"] = calc_atr(df_15, 14)
     df_15["ADX"] = calc_adx(df_15, 14)
 
-    # Today's 5m Data
     time_col = "Datetime" if "Datetime" in df_5.columns else "Date"
     df_5["DT"] = pd.to_datetime(df_5[time_col])
     df_5["DateOnly"] = df_5["DT"].dt.date
@@ -91,7 +102,6 @@ if not df_15.empty and not df_5.empty:
     adx_val = round(float(c15["ADX"]), 1)
     atr_val = float(c15["ATR"])
 
-    # Option Strikes (ITM & ATM)
     atm_strike = int(round(spot / strike_step) * strike_step)
     itm_ce = atm_strike - strike_step
     itm_pe = atm_strike + strike_step
@@ -165,10 +175,14 @@ if not df_15.empty and not df_5.empty:
         st.info(f"💡 **Agla Buy Kab Banega?** **CALL BUY** ke liye price ko **VWAP (`{vwap_now}`) & 9 EMA (`{ema9_5m}`)** ke upar hold karne dein; **PUT BUY** ke liye dono ke neeche red candle close hone dein.")
 
     elif score >= threshold:
+        duration_text, hold_mins = get_move_duration(abs(score), adx_val, rsi_val)
+        max_exit_clock = (now_ist + timedelta(minutes=hold_mins)).strftime("%I:%M %p")
         t1 = round(spot + (atr_val * 0.65), 1)
         t2 = round(spot + (atr_val * 1.2), 1)
         sl = round(min(spot - (atr_val * 0.45), ema9_5m - 8), 1)
+
         st.success(f"🟢 **ACTION: CALL BUY KAREIN (CE BUY) — Market Upar Jayega | Accuracy: {min(score, 95)}%**")
+        st.info(f"⏱️ **KITNI DER UPAR RAHEGA:** **{duration_text}** — Max Hold Time: **`{max_exit_clock}`** (is time tak har haal mein profit book karke out ho jayein!)")
         
         c1, c2 = st.columns(2)
         with c1:
@@ -186,6 +200,7 @@ if not df_15.empty and not df_5.empty:
         with c2:
             st.markdown(f"""
             ### 🎯 3. Call Se Out (Profit Book) Kab Hona Hai:
+            * **Time Exit Limit:** `{max_exit_clock}` tak agar target na bhi aaye toh out ho jayein (Theta decay se bachne ke liye).
             * **Target 1 (50% Book):** Spot `{t1}` — Yahan SL ko apne buying price par le aayein.
             * **Target 2 (Full Exit):** Spot `{t2}` — Poora profit book karke out ho jayein.
             * **Early Exit:** Agar 5m red candle **9 EMA (`{ema9_5m}`)** ke neeche close de toh turant exit!
@@ -197,10 +212,14 @@ if not df_15.empty and not df_5.empty:
             """)
 
     elif score <= -threshold:
+        duration_text, hold_mins = get_move_duration(abs(score), adx_val, rsi_val)
+        max_exit_clock = (now_ist + timedelta(minutes=hold_mins)).strftime("%I:%M %p")
         t1 = round(spot - (atr_val * 0.65), 1)
         t2 = round(spot - (atr_val * 1.2), 1)
         sl = round(max(spot + (atr_val * 0.45), ema9_5m + 8), 1)
+
         st.error(f"🔴 **ACTION: PUT BUY KAREIN (PE BUY) — Market Neeche Girega | Accuracy: {min(abs(score), 95)}%**")
+        st.info(f"⏱️ **KITNI DER NEECHE RAHEGA:** **{duration_text}** — Max Hold Time: **`{max_exit_clock}`** (is time tak har haal mein profit book karke out ho jayein!)")
         
         c1, c2 = st.columns(2)
         with c1:
@@ -218,6 +237,7 @@ if not df_15.empty and not df_5.empty:
         with c2:
             st.markdown(f"""
             ### 🎯 3. Put Se Out (Profit Book) Kab Hona Hai:
+            * **Time Exit Limit:** `{max_exit_clock}` tak agar target na bhi aaye toh out ho jayein (Theta decay se bachne ke liye).
             * **Target 1 (50% Book):** Spot `{t1}` — Yahan SL ko apne buying price par le aayein.
             * **Target 2 (Full Exit):** Spot `{t2}` — Poora profit book karke out ho jayein.
             * **Early Exit:** Agar 5m green candle **9 EMA (`{ema9_5m}`)** ke upar close de toh turant exit!
@@ -228,7 +248,6 @@ if not df_15.empty and not df_5.empty:
             * 2:45 PM ke baad naya trade na lein.
             """)
 
-    # Clean Pro Chart
     today_5["TimeStr"] = today_5["DT"].dt.strftime("%H:%M")
     fig = go.Figure(data=[go.Candlestick(
         x=today_5["TimeStr"], open=today_5["Open"], high=today_5["High"],
